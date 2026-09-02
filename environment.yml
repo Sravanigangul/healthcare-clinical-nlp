@@ -1,0 +1,21 @@
+name: clinical-nlp
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - pip:
+      - spacy
+      - gensim
+      - torch
+      - transformers
+      - sentence-transformers
+      - huggingface-hub
