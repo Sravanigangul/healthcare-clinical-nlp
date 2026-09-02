@@ -1,0 +1,20 @@
+# Core data science
+numpy
+pandas
+scipy
+matplotlib
+
+# Machine learning / NLP
+scikit-learn
+spacy
+gensim
+
+# Transformers / embeddings
+torch
+transformers
+sentence-transformers
+huggingface-hub
+
+# Notebook environment
+jupyterlab
+ipykernel
