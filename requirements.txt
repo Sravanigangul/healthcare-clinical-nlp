@@ -18,3 +18,4 @@ huggingface-hub
 # Notebook environment
 jupyterlab
 ipykernel
+gradio
