@@ -255,4 +255,4 @@ Planned areas for further development include:
 
 **Sravani Gangula**
 
-Healthcare Data Analytics | Clinical NLP | Data Science | Healthcare AI
+Healthcare Data Science | Clinical NLP | Data Science | Healthcare AI
