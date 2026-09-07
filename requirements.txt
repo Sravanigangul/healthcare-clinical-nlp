@@ -19,3 +19,4 @@ huggingface-hub
 jupyterlab
 ipykernel
 gradio
+pytest
