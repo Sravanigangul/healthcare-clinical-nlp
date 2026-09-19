@@ -1,88 +1,225 @@
+"""
+Clinical NLP Pipeline
+=====================
+
+Core NER engine:
+    Fine-tuned BioClinicalBERT
+
+Supporting deterministic components:
+    - Medication extraction
+    - Laboratory value extraction
+    - Negation detection
+    - Drug-drug interaction lookup
+    - Structured patient record generation
+
+Long clinical documents are processed using overlapping
+512-token windows with a stride of 128 tokens.
+"""
+
 import re
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-import torch
-import spacy
-nlp = spacy.blank("en")
+from collections import defaultdict
 
+import numpy as np
+import spacy
+import torch
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForTokenClassification,
+)
 
 from app.references import DRUG_LIST, DDI_REF
 
 
-DOSE_UNIT = r'(?:mg|g|mcg|ml|l|units|IU|mEq|meq|pills|tablets|capsules)'
+# ============================================================
+# 1. BASIC NLP SETUP
+# ============================================================
 
-ROUTE_PAT = r'(?:PO|IV|IM|SC|SL|PR|topical|inhalation|nasal|ophthalmic|otic)'
+# We use spaCy only for word tokenization.
+# No pretrained spaCy model is required.
+nlp = spacy.blank("en")
+
+
+# ============================================================
+# 2. MEDICATION PATTERNS
+# ============================================================
+
+DOSE_UNIT = (
+    r"(?:mg|g|mcg|ml|l|units|IU|mEq|meq|"
+    r"pills|tablets|capsules)"
+)
+
+ROUTE_PAT = (
+    r"(?:PO|IV|IM|SC|SL|PR|topical|inhalation|"
+    r"nasal|ophthalmic|otic)"
+)
 
 FREQ_PAT = (
-    r'(?:QD|BID|TID|QID|PRN|'
-    r'once\s+daily|twice\s+daily|three\s+times\s+daily|four\s+times\s+daily|'
-    r'once\s+a\s+day|twice\s+a\s+day|three\s+times\s+a\s+day|'
-    r'daily|weekly|monthly|'
-    r'every\s+\d+\s+(?:hours?|days?|weeks?|months?))'
+    r"(?:QD|BID|TID|QID|PRN|"
+    r"once\s+daily|"
+    r"twice\s+daily|"
+    r"three\s+times\s+daily|"
+    r"four\s+times\s+daily|"
+    r"once\s+a\s+day|"
+    r"twice\s+a\s+day|"
+    r"three\s+times\s+a\s+day|"
+    r"daily|weekly|monthly|"
+    r"every\s+\d+\s+(?:hours?|days?|weeks?|months?))"
 )
 
+
 DRUG_PAT = (
-    r'\b('
-    + '|'.join(re.escape(drug) for drug in DRUG_LIST)
-    + r')\b'
+    r"\b("
+    + "|".join(
+        re.escape(drug)
+        for drug in DRUG_LIST
+    )
+    + r")\b"
 )
+
 
 MED_PAT = (
     DRUG_PAT
-    + r'(?:[\s,]+(\d+(?:\.\d+)?)\s*(' + DOSE_UNIT + r'))?'
-    + r'(?:[\s,]+(' + ROUTE_PAT + r'))?'
-    + r'(?:[\s,]+(' + FREQ_PAT + r'))?'
+    + r"(?:[\s,]+(\d+(?:\.\d+)?)\s*("
+    + DOSE_UNIT
+    + r"))?"
+    + r"(?:[\s,]+("
+    + ROUTE_PAT
+    + r"))?"
+    + r"(?:[\s,]+("
+    + FREQ_PAT
+    + r"))?"
 )
 
+
+# ============================================================
+# 3. LAB PATTERNS
+# ============================================================
+
 LAB_PATTERNS = {
-    "hemoglobin": r'\bhemoglobin\s+(?:was\s+|is\s+)?(\d+(?:\.\d+)?)\s*(g/dL)?',
-    "creatinine": r'\bcreatinine\s+(?:was\s+|is\s+)?(\d+(?:\.\d+)?)\s*(mg/dL)?',
-    "glucose": r'\bglucose\s+(?:was\s+|is\s+)?(\d+(?:\.\d+)?)\s*(mg/dL)?',
+
+    "hemoglobin": (
+        r"\bhemoglobin\s+"
+        r"(?:was\s+|is\s+)?"
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(g/dL)?"
+    ),
+
+    "creatinine": (
+        r"\bcreatinine\s+"
+        r"(?:was\s+|is\s+)?"
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(mg/dL)?"
+    ),
+
+    "glucose": (
+        r"\bglucose\s+"
+        r"(?:was\s+|is\s+)?"
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(mg/dL)?"
+    ),
 }
 
-def extract_meds(text):
-    seen = set()
-    meds = []
 
-    for match in re.finditer(MED_PAT, text, re.IGNORECASE):
+# ============================================================
+# 4. MEDICATION EXTRACTION
+# ============================================================
+
+def extract_meds(text):
+    """
+    Extract known medications and optional dose, unit,
+    route and frequency information.
+
+    This is a deterministic supporting layer.
+    """
+
+    seen = set()
+    medications = []
+
+    for match in re.finditer(
+        MED_PAT,
+        text,
+        re.IGNORECASE
+    ):
+
         drug = match.group(1).lower()
 
-        if drug not in seen:
-            seen.add(drug)
+        # Avoid duplicate medication entries.
+        if drug in seen:
+            continue
 
-            meds.append({
-                "drug": drug,
-                "dose": (match.group(2) or "").strip(),
-                "unit": (match.group(3) or "").strip(),
-                "route": (match.group(4) or "").upper(),
-                "frequency": (match.group(5) or "").upper(),
-            })
+        seen.add(drug)
 
-    return meds
+        medications.append({
+            "drug": drug,
+            "dose": (
+                match.group(2) or ""
+            ).strip(),
+            "unit": (
+                match.group(3) or ""
+            ).strip(),
+            "route": (
+                match.group(4) or ""
+            ).upper(),
+            "frequency": (
+                match.group(5) or ""
+            ).upper(),
+        })
 
+    return medications
+
+
+# ============================================================
+# 5. DRUG-DRUG INTERACTION CHECK
+# ============================================================
 
 def check_ddi(medication_list):
-    med_names = {
-        med["drug"].lower()
-        for med in medication_list
+    """
+    Check extracted medications against the small
+    educational DDI reference table.
+
+    This is NOT a comprehensive clinical DDI database.
+    """
+
+    medication_names = {
+        medication["drug"].lower()
+        for medication in medication_list
     }
 
-    flagged = []
+    flagged_interactions = []
 
-    for drug1, drug2, severity, message in DDI_REF:
-        if drug1 in med_names and drug2 in med_names:
-            flagged.append({
+    for (
+        drug1,
+        drug2,
+        severity,
+        message
+    ) in DDI_REF:
+
+        if (
+            drug1.lower() in medication_names
+            and
+            drug2.lower() in medication_names
+        ):
+
+            flagged_interactions.append({
                 "drug1": drug1,
                 "drug2": drug2,
                 "severity": severity,
                 "message": message,
             })
 
-    return flagged
+    return flagged_interactions
+
+
+# ============================================================
+# 6. LAB EXTRACTION
+# ============================================================
 
 def extract_labs(text):
     """
-    Extract common laboratory values from clinical text.
+    Extract a small set of common laboratory values
+    using deterministic regular expressions.
     """
 
     labs = []
@@ -98,130 +235,178 @@ def extract_labs(text):
             labs.append({
                 "name": lab_name,
                 "value": match.group(1),
-                "unit": match.group(2) or ""
+                "unit": match.group(2) or "",
             })
 
     return labs
 
 
-def analyze_note(text):
-    if not text or not text.strip():
-        return {
-            "medications": [],
-            "drug_interactions": [],
-        }
-
-    meds = extract_meds(text)
-    interactions = check_ddi(meds)
-
-    return {
-        "medications": meds,
-        "drug_interactions": interactions,
-    }
+# ============================================================
+# 7. CREATE EMPTY PATIENT RECORD
+# ============================================================
 
 def create_patient_record():
     """
-    Create the standard output structure for our clinical document.
+    Create the standard structured output used by
+    the Clinical Document Review Assistant.
     """
 
-    patient_record = {
+    return {
+
         "demographics": {
-            "age":[],
-            "sex":[]
+            "age": [],
+            "sex": [],
         },
 
-        "conditions":[],
-        "symptoms":[],
-        "medications":[],
-        "labs":[],
+        "conditions": [],
+
+        "symptoms": [],
+
+        "medications": [],
+
+        "labs": [],
+
         "vitals": [],
-        "diagnostic_procedures":[],
-        "therapeutic_procedures":[],
-        "negated_findings":[],
-        "icd10_candidates" :[],
-        "drug_interactions":[],
-        "summary":""
+
+        "diagnostic_procedures": [],
+
+        "therapeutic_procedures": [],
+
+        "negated_findings": [],
+
+        "icd10_candidates": [],
+
+        "drug_interactions": [],
+
+        "entities": [],
+
+        "summary": "",
     }
 
-    return patient_record
-def load_ner_model():
+
+# ============================================================
+# 8. LOAD BIOCLINICALBERT
+# ============================================================
+
+def load_ner_model(
+    checkpoint_path=None
+):
     """
-    Load the fine-tuned BioClinicalBERT NER model.
+    Load the fine-tuned BioClinicalBERT clinical NER model.
+
+    If checkpoint_path is not supplied, the application
+    looks for:
+
+        models/clinical_ner_final/
+
+    relative to the project root.
     """
 
-    project_root = Path(__file__).resolve().parent.parent
+    if checkpoint_path is None:
 
-    checkpoint_path = (
-        project_root
-        / "models"
-        / "clinical_ner"
-        / "checkpoint-216"
-    )
+        project_root = (
+            Path(__file__)
+            .resolve()
+            .parent
+            .parent
+        )
 
-    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint_path = (
+            project_root
+            / "models"
+            / "clinical_ner_final"
+        )
+
+    checkpoint_path = Path(
         checkpoint_path
     )
 
-    model = AutoModelForTokenClassification.from_pretrained(
-        checkpoint_path
+
+    if not checkpoint_path.exists():
+
+        raise FileNotFoundError(
+            "\nFine-tuned clinical NER model was not found.\n\n"
+            f"Expected location:\n{checkpoint_path}\n\n"
+            "Reproduce/download the final BioClinicalBERT "
+            "checkpoint and place it in this directory."
+        )
+
+
+    tokenizer = (
+        AutoTokenizer.from_pretrained(
+            checkpoint_path
+        )
     )
+
+
+    model = (
+        AutoModelForTokenClassification
+        .from_pretrained(
+            checkpoint_path
+        )
+    )
+
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+
+    model.to(device)
 
     model.eval()
 
+
     return tokenizer, model
 
-def extract_clinical_entities(text, tokenizer, model):
+
+# ============================================================
+# 9. OVERLAP-AWARE BIOCLINICALBERT NER
+# ============================================================
+
+def predict_word_labels(
+    text,
+    tokenizer,
+    model,
+    max_length=512,
+    stride=128
+):
     """
-    Extract clinical entities from a short clinical note
-    using the fine-tuned BioClinicalBERT model.
-    """
+    Predict one BIO label for each represented original word.
 
-    #Convert text into tokens/numbers BERT understands
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation= True,
-        max_length=512
-    )
+    Long documents are processed using overlapping chunks.
 
-    #Turn off gradient calculations because we are not training
-    with torch.no_grad():
-        outputs = model(**inputs)
+    Pipeline:
 
-    #Get the most likely label for every token
-    predicted_ids = torch.argmax(
-        outputs.logits,
-        dim=-1
-    )[0]
-
-    #Convert token IDs back into readable tokens
-    tokens = tokenizer.convert_ids_to_tokens(
-        inputs["input_ids"][0]
-    )
-
-    #Convert predicted label numbers into label names
-    predictions = []
-
-    for token, predicted_id in zip(tokens, predicted_ids):
-
-        label = model.config.id2label[
-            predicted_id.item()
-        ]
-
-        predictions.append({
-            "token":token,
-            "label":label
-        })
-
-    return predictions
-
-def tokenize_clinical_text(text, tokenizer):
-    """
-    Tokenize clinical text using the same word-level structure
-    used during BioClinicalBERT training.
+        clinical text
+            ↓
+        spaCy words
+            ↓
+        BioClinicalBERT WordPieces
+            ↓
+        512-token windows
+            ↓
+        128-token overlap
+            ↓
+        model logits
+            ↓
+        map back to original words
+            ↓
+        average overlapping logits
+            ↓
+        one BIO label per word
     """
 
-    # Step 1: Split the clinical text into words with spaCy
+    if not text or not text.strip():
+        return []
+
+
+    # --------------------------------------------------------
+    # ORIGINAL WORD TOKENIZATION
+    # --------------------------------------------------------
+
     doc = nlp(text)
 
     words = [
@@ -229,253 +414,1001 @@ def tokenize_clinical_text(text, tokenizer):
         for token in doc
     ]
 
-    # Step 2: Pass those words to the BioClinicalBERT tokenizer
+
+    if not words:
+        return []
+
+
+    # --------------------------------------------------------
+    # WORDPIECE TOKENIZATION + OVERFLOW
+    # --------------------------------------------------------
+
     tokenized = tokenizer(
         words,
         is_split_into_words=True,
         truncation=True,
-        max_length=512,
-        return_tensors="pt"
+        max_length=max_length,
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_tensors=None,
     )
 
-    # Step 3: Map BERT tokens back to the original words
-    word_ids = tokenized.word_ids(
-        batch_index=0
+
+    # --------------------------------------------------------
+    # MODEL DEVICE
+    # --------------------------------------------------------
+
+    device = next(
+        model.parameters()
+    ).device
+
+
+    model.eval()
+
+
+    # word_id:
+    #
+    #     original spaCy word index
+    #
+    # value:
+    #
+    #     one or more 82-dimensional logit vectors
+    #
+    # Multiple vectors occur when a word appears in
+    # overlapping chunks.
+
+    word_logits = defaultdict(list)
+
+
+    number_of_chunks = len(
+        tokenized["input_ids"]
     )
 
-    return words, tokenized, word_ids
 
-def predict_word_labels(text, tokenizer, model):
-    """
-    Predict one clinical NER label for each original word.
-    """
+    # --------------------------------------------------------
+    # PROCESS EVERY CHUNK
+    # --------------------------------------------------------
 
-    # Use the tokenization pipeline we just tested
-    words, tokenized, word_ids = tokenize_clinical_text(
-        text,
-        tokenizer
-    )
-
-    # Run the trained BioClinicalBERT model
     with torch.no_grad():
-        outputs = model(**tokenized)
 
-    # Choose the highest-scoring label for every BERT token
-    predicted_ids = torch.argmax(
-        outputs.logits,
-        dim=-1
-    )[0]
+        for chunk_idx in range(
+            number_of_chunks
+        ):
 
-    word_predictions = []
+            input_ids = torch.tensor(
+                [
+                    tokenized[
+                        "input_ids"
+                    ][chunk_idx]
+                ],
+                dtype=torch.long,
+                device=device,
+            )
 
-    previous_word_id = None
 
-    for predicted_id, word_id in zip(
-        predicted_ids,
-        word_ids
+            attention_mask = torch.tensor(
+                [
+                    tokenized[
+                        "attention_mask"
+                    ][chunk_idx]
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+
+
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+
+
+            # BERT models may provide token_type_ids.
+            if "token_type_ids" in tokenized:
+
+                model_inputs[
+                    "token_type_ids"
+                ] = torch.tensor(
+                    [
+                        tokenized[
+                            "token_type_ids"
+                        ][chunk_idx]
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+
+            # ------------------------------------------------
+            # BIOCLINICALBERT FORWARD PASS
+            # ------------------------------------------------
+
+            outputs = model(
+                **model_inputs
+            )
+
+
+            # Shape:
+            #
+            # sequence length × number of labels
+            #
+            # In our trained model:
+            #
+            # sequence length × 82
+
+            logits = (
+                outputs
+                .logits[0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+
+            # ------------------------------------------------
+            # MAP WORDPIECES → ORIGINAL WORDS
+            # ------------------------------------------------
+
+            word_ids = tokenized.word_ids(
+                batch_index=chunk_idx
+            )
+
+
+            previous_word_id = None
+
+
+            for token_idx, word_id in enumerate(
+                word_ids
+            ):
+
+                # [CLS], [SEP], padding, etc.
+                if word_id is None:
+                    continue
+
+
+                # Only use the first WordPiece belonging
+                # to each original word.
+                #
+                # Example:
+                #
+                # palpitations
+                #
+                # p        ← use
+                # ##al     ← ignore
+                # ##pit    ← ignore
+                # ##ations ← ignore
+
+                if word_id == previous_word_id:
+                    continue
+
+
+                word_logits[
+                    word_id
+                ].append(
+                    logits[token_idx]
+                )
+
+
+                previous_word_id = word_id
+
+
+    # --------------------------------------------------------
+    # RECONSTRUCT ORIGINAL WORD PREDICTIONS
+    # --------------------------------------------------------
+
+    predictions = []
+
+
+    for word_id, word in enumerate(
+        words
     ):
 
-        # Ignore [CLS] and [SEP]
-        if word_id is None:
+        # Certain whitespace/newline tokens may not produce
+        # a WordPiece.
+        if word_id not in word_logits:
             continue
 
-        # Only use the first WordPiece for each original word
-        if word_id == previous_word_id:
-            continue
 
-        label = model.config.id2label[
-            predicted_id.item()
-        ]
+        # Average predictions from overlapping windows.
+        average_logits = np.mean(
+            word_logits[word_id],
+            axis=0
+        )
 
-        word_predictions.append({
-            "word": words[word_id],
-            "label": label
+
+        predicted_id = int(
+            np.argmax(
+                average_logits
+            )
+        )
+
+
+        predicted_label = (
+            model.config.id2label[
+                predicted_id
+            ]
+        )
+
+
+        # Convert logits to probabilities so the application
+        # can display a model confidence value.
+        probabilities = torch.softmax(
+            torch.tensor(
+                average_logits,
+                dtype=torch.float32
+            ),
+            dim=-1,
+        )
+
+
+        confidence = float(
+            probabilities[
+                predicted_id
+            ].item()
+        )
+
+
+        predictions.append({
+
+            "word": word,
+
+            "word_id": word_id,
+
+            "label": predicted_label,
+
+            "confidence": round(
+                confidence,
+                4
+            ),
         })
 
-        previous_word_id = word_id
 
-    return word_predictions
-def merge_bio_entities(word_predictions):
+    return predictions
+
+
+# ============================================================
+# 10. MERGE BIO LABELS INTO COMPLETE ENTITIES
+# ============================================================
+
+def merge_bio_entities(
+    word_predictions
+):
     """
-    Merge word-level BIO predictions into complete clinical entities.
+    Convert word-level BIO predictions into complete
+    clinical entities.
+
+    Example:
+
+        chest     B-Sign_symptom
+        pain      I-Sign_symptom
+
+    becomes:
+
+        {
+            "text": "chest pain",
+            "type": "Sign_symptom"
+        }
     """
 
     entities = []
 
     current_entity = None
 
+
     for prediction in word_predictions:
 
         word = prediction["word"]
+
         label = prediction["label"]
 
-        # O means this word is not part of an entity
+        confidence = prediction.get(
+            "confidence",
+            0.0
+        )
+
+
+        # ----------------------------------------------------
+        # OUTSIDE ENTITY
+        # ----------------------------------------------------
+
         if label == "O":
 
             if current_entity is not None:
-                entities.append(current_entity)
+
+                # Average confidence across entity words.
+                scores = current_entity.pop(
+                    "_scores"
+                )
+
+                current_entity[
+                    "confidence"
+                ] = round(
+                    sum(scores) / len(scores),
+                    4
+                )
+
+                entities.append(
+                    current_entity
+                )
+
                 current_entity = None
 
             continue
 
-        # Split B-Sign_symptom into:
-        # prefix = B
-        # entity_type = Sign_symptom
-        prefix, entity_type = label.split("-", 1)
+
+        # Ignore malformed labels safely.
+        if "-" not in label:
+            continue
+
+
+        prefix, entity_type = (
+            label.split(
+                "-",
+                1
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # BEGINNING OF ENTITY
+        # ----------------------------------------------------
 
         if prefix == "B":
 
-            # Save the previous entity first
             if current_entity is not None:
-                entities.append(current_entity)
 
-            # Start a new entity
+                scores = current_entity.pop(
+                    "_scores"
+                )
+
+                current_entity[
+                    "confidence"
+                ] = round(
+                    sum(scores) / len(scores),
+                    4
+                )
+
+                entities.append(
+                    current_entity
+                )
+
+
             current_entity = {
+
                 "text": word,
-                "type": entity_type
+
+                "type": entity_type,
+
+                "_scores": [
+                    confidence
+                ],
             }
+
+
+        # ----------------------------------------------------
+        # INSIDE ENTITY
+        # ----------------------------------------------------
 
         elif prefix == "I":
 
-            # Continue the existing entity
             if (
                 current_entity is not None
-                and current_entity["type"] == entity_type
+                and
+                current_entity["type"]
+                == entity_type
             ):
-                current_entity["text"] += " " + word
 
-    # Save the final entity
+                current_entity[
+                    "text"
+                ] += " " + word
+
+                current_entity[
+                    "_scores"
+                ].append(
+                    confidence
+                )
+
+            else:
+
+                # BIO repair:
+                #
+                # If the model predicts I-X without an
+                # existing B-X, treat it as the start of
+                # an entity instead of silently losing it.
+
+                if current_entity is not None:
+
+                    scores = current_entity.pop(
+                        "_scores"
+                    )
+
+                    current_entity[
+                        "confidence"
+                    ] = round(
+                        sum(scores) / len(scores),
+                        4
+                    )
+
+                    entities.append(
+                        current_entity
+                    )
+
+
+                current_entity = {
+
+                    "text": word,
+
+                    "type": entity_type,
+
+                    "_scores": [
+                        confidence
+                    ],
+                }
+
+
+    # --------------------------------------------------------
+    # SAVE FINAL ENTITY
+    # --------------------------------------------------------
+
     if current_entity is not None:
-        entities.append(current_entity)
+
+        scores = current_entity.pop(
+            "_scores"
+        )
+
+        current_entity[
+            "confidence"
+        ] = round(
+            sum(scores) / len(scores),
+            4
+        )
+
+        entities.append(
+            current_entity
+        )
+
 
     return entities
 
-def detect_negated_entities(text, entities):
+
+# ============================================================
+# 11. NEGATION DETECTION
+# ============================================================
+
+def detect_negated_entities(
+    text,
+    entities,
+    window_size=5
+):
     """
-    Identify extracted entities that are preceded by
-    common clinical negation terms.
+    Identify entities preceded by common clinical
+    negation expressions.
+
+    This is a lightweight rule-based supporting layer,
+    not a full clinical negation model.
     """
 
-    negation_terms = [
+    negation_terms = {
         "no",
         "not",
         "denies",
         "denied",
-        "without"
-    ]
+        "without",
+        "negative",
+    }
+
 
     negated_entities = []
 
+
     text_lower = text.lower()
+
 
     for entity in entities:
 
-        entity_text = entity["text"].lower()
+        entity_text = (
+            entity["text"]
+            .lower()
+        )
 
-        entity_position = text_lower.find(entity_text)
+
+        entity_position = (
+            text_lower.find(
+                entity_text
+            )
+        )
+
 
         if entity_position == -1:
             continue
 
-        text_before_entity = text_lower[:entity_position]
 
-        words_before = text_before_entity.split()
+        text_before_entity = (
+            text_lower[
+                :entity_position
+            ]
+        )
 
-        window = words_before[-5:]
+
+        words_before = (
+            text_before_entity
+            .split()
+        )
+
+
+        window = words_before[
+            -window_size:
+        ]
+
 
         if any(
             term in window
             for term in negation_terms
         ):
-            negated_entities.append(entity)
+
+            negated_entity = (
+                entity.copy()
+            )
+
+            negated_entity[
+                "negated"
+            ] = True
+
+            negated_entities.append(
+                negated_entity
+            )
+
 
     return negated_entities
 
-def add_entities_to_patient_record(patient_record, entities):
+
+# ============================================================
+# 12. ADD BIOCLINICALBERT ENTITIES TO PATIENT RECORD
+# ============================================================
+
+def add_entities_to_patient_record(
+    patient_record,
+    entities
+):
     """
-    Add extracted clinical entities to the appropriate
-    sections of the patient record.
+    Map selected BioClinicalBERT entity categories into
+    clinically useful patient-record sections.
+
+    The complete raw entity list is still retained
+    separately under patient_record["entities"].
     """
 
     for entity in entities:
 
-        entity_text = entity["text"]
-        entity_type = entity["type"]
+        entity_text = entity[
+            "text"
+        ]
+
+        entity_type = entity[
+            "type"
+        ]
+
 
         if entity_type == "Disease_disorder":
-            patient_record["conditions"].append(entity_text)
+
+            patient_record[
+                "conditions"
+            ].append(
+                entity_text
+            )
+
 
         elif entity_type == "Sign_symptom":
-            patient_record["symptoms"].append(entity_text)
 
-        elif entity_type == "Lab_value":
-            patient_record["labs"].append(entity_text)
+            patient_record[
+                "symptoms"
+            ].append(
+                entity_text
+            )
+
 
         elif entity_type == "Diagnostic_procedure":
-            patient_record["diagnostic_procedures"].append(entity_text)
+
+            patient_record[
+                "diagnostic_procedures"
+            ].append(
+                entity_text
+            )
+
 
         elif entity_type == "Therapeutic_procedure":
-            patient_record["therapeutic_procedures"].append(entity_text)
+
+            patient_record[
+                "therapeutic_procedures"
+            ].append(
+                entity_text
+            )
+
 
         elif entity_type == "Age":
-            patient_record["demographics"]["age"].append(entity_text)
+
+            patient_record[
+                "demographics"
+            ][
+                "age"
+            ].append(
+                entity_text
+            )
+
 
         elif entity_type == "Sex":
-            patient_record["demographics"]["sex"].append(entity_text)
+
+            patient_record[
+                "demographics"
+            ][
+                "sex"
+            ].append(
+                entity_text
+            )
+
 
     return patient_record
 
-def build_patient_record(text, tokenizer, model):
+
+# ============================================================
+# 13. REMOVE DUPLICATES
+# ============================================================
+
+def deduplicate_list(values):
     """
-    Analyze a clinical note and populate the structured patient record.
+    Remove duplicate strings while preserving order.
     """
 
+    seen = set()
 
-    patient_record = create_patient_record()
+    result = []
 
-    # Extract medications
-    medications = extract_meds(text)
-    patient_record["medications"] = medications
 
-    # Extract laboratory values
-    labs = extract_labs(text)
-    patient_record["labs"] = labs
+    for value in values:
 
-    # Run clinical NER
-    word_predictions = predict_word_labels(
-        text,
-        tokenizer,
-        model
+        key = (
+            value.lower()
+            if isinstance(value, str)
+            else str(value)
+        )
+
+
+        if key not in seen:
+
+            seen.add(key)
+
+            result.append(
+                value
+            )
+
+
+    return result
+
+
+# ============================================================
+# 14. BUILD COMPLETE PATIENT RECORD
+# ============================================================
+
+def build_patient_record(
+    text,
+    tokenizer,
+    model
+):
+    """
+    Run the complete Clinical Document Review pipeline.
+
+    BioClinicalBERT is the core entity extraction engine.
+
+    Regex/rule-based components provide supporting
+    structured extraction for medications, labs,
+    negation and DDI checking.
+    """
+
+    patient_record = (
+        create_patient_record()
     )
 
-    # Merge BIO labels into complete entities
+
+    if not text or not text.strip():
+        return patient_record
+
+
+    # --------------------------------------------------------
+    # A. MEDICATION EXTRACTION
+    # --------------------------------------------------------
+
+    medications = extract_meds(
+        text
+    )
+
+
+    patient_record[
+        "medications"
+    ] = medications
+
+
+    # --------------------------------------------------------
+    # B. LAB EXTRACTION
+    # --------------------------------------------------------
+
+    structured_labs = extract_labs(
+        text
+    )
+
+
+    patient_record[
+        "labs"
+    ] = structured_labs
+
+
+    # --------------------------------------------------------
+    # C. DRUG INTERACTIONS
+    # --------------------------------------------------------
+
+    patient_record[
+        "drug_interactions"
+    ] = check_ddi(
+        medications
+    )
+
+
+    # --------------------------------------------------------
+    # D. BIOCLINICALBERT NER
+    # --------------------------------------------------------
+
+    word_predictions = (
+        predict_word_labels(
+            text,
+            tokenizer,
+            model,
+            max_length=512,
+            stride=128,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # E. BIO → COMPLETE ENTITIES
+    # --------------------------------------------------------
+
     entities = merge_bio_entities(
         word_predictions
     )
 
-    # Detect which entities are negated
-    negated_entities = detect_negated_entities(
-        text,
-        entities
+
+    # Store ALL model-extracted entities.
+    patient_record[
+        "entities"
+    ] = entities
+
+
+    # --------------------------------------------------------
+    # F. NEGATION
+    # --------------------------------------------------------
+
+    negated_entities = (
+        detect_negated_entities(
+            text,
+            entities
+        )
     )
 
-    # Store negated findings
-    patient_record["negated_findings"] = [
-        entity["text"]
+
+    patient_record[
+        "negated_findings"
+    ] = [
+        {
+            "text": entity["text"],
+            "type": entity["type"],
+            "confidence": entity.get(
+                "confidence"
+            ),
+        }
         for entity in negated_entities
     ]
 
-    # Remove negated entities from active entities
+
+    # Build simple keys for removing negated entities
+    # from active findings.
+    negated_keys = {
+        (
+            entity["text"].lower(),
+            entity["type"],
+        )
+        for entity in negated_entities
+    }
+
+
     active_entities = [
+
         entity
+
         for entity in entities
-        if entity not in negated_entities
+
+        if (
+            entity["text"].lower(),
+            entity["type"],
+        )
+        not in negated_keys
     ]
 
-    # Add only active entities to the patient record
-    patient_record = add_entities_to_patient_record(
-        patient_record,
-        active_entities
+
+    # --------------------------------------------------------
+    # G. MAP ACTIVE ENTITIES INTO STRUCTURED RECORD
+    # --------------------------------------------------------
+
+    patient_record = (
+        add_entities_to_patient_record(
+            patient_record,
+            active_entities
+        )
     )
 
+
+    # --------------------------------------------------------
+    # H. DEDUPLICATE SIMPLE OUTPUTS
+    # --------------------------------------------------------
+
+    patient_record[
+        "conditions"
+    ] = deduplicate_list(
+        patient_record[
+            "conditions"
+        ]
+    )
+
+
+    patient_record[
+        "symptoms"
+    ] = deduplicate_list(
+        patient_record[
+            "symptoms"
+        ]
+    )
+
+
+    patient_record[
+        "diagnostic_procedures"
+    ] = deduplicate_list(
+        patient_record[
+            "diagnostic_procedures"
+        ]
+    )
+
+
+    patient_record[
+        "therapeutic_procedures"
+    ] = deduplicate_list(
+        patient_record[
+            "therapeutic_procedures"
+        ]
+    )
+
+
+    patient_record[
+        "demographics"
+    ][
+        "age"
+    ] = deduplicate_list(
+        patient_record[
+            "demographics"
+        ][
+            "age"
+        ]
+    )
+
+
+    patient_record[
+        "demographics"
+    ][
+        "sex"
+    ] = deduplicate_list(
+        patient_record[
+            "demographics"
+        ][
+            "sex"
+        ]
+    )
+
+
     return patient_record
+
+
+# ============================================================
+# 15. SIMPLE COMPATIBILITY FUNCTION
+# ============================================================
+
+def analyze_note(
+    text,
+    tokenizer=None,
+    model=None
+):
+    """
+    Analyze a clinical note.
+
+    If a BioClinicalBERT tokenizer/model is supplied,
+    run the complete pipeline.
+
+    Otherwise return only the deterministic medication,
+    laboratory and DDI components.
+    """
+
+    if not text or not text.strip():
+
+        if tokenizer is not None and model is not None:
+            return create_patient_record()
+
+        return {
+            "medications": [],
+            "labs": [],
+            "drug_interactions": [],
+        }
+
+
+    # Full model pipeline
+    if (
+        tokenizer is not None
+        and
+        model is not None
+    ):
+
+        return build_patient_record(
+            text,
+            tokenizer,
+            model
+        )
+
+
+    # Supporting rules only
+    medications = extract_meds(
+        text
+    )
+
+
+    return {
+
+        "medications": medications,
+
+        "labs": extract_labs(
+            text
+        ),
+
+        "drug_interactions": check_ddi(
+            medications
+        ),
+    }
+
+
+# ============================================================
+# 16. OPTIONAL QUICK TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    example_text = """
+    A 54-year-old female presented with chest pain and
+    shortness of breath. She denies fever.
+
+    Creatinine was 1.4 mg/dL and hemoglobin was
+    10.8 g/dL.
+
+    The patient takes aspirin 81 mg PO daily.
+    """
+
+
+    print(
+        "\nClinical NLP supporting-rule test\n"
+    )
+
+
+    print(
+        analyze_note(
+            example_text
+        )
+    )
+
+
+    print(
+        "\nTo run BioClinicalBERT NER, place the final "
+        "checkpoint in models/clinical_ner_final/."
+    )
