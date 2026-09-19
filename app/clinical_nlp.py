@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines,too-many-locals
 """
 Clinical NLP Pipeline
 =====================
@@ -15,6 +16,7 @@ Supporting deterministic components:
 Long clinical documents are processed using overlapping
 512-token windows with a stride of 128 tokens.
 """
+# pylint: disable=too-many-lines
 
 import re
 from pathlib import Path
@@ -365,7 +367,7 @@ def load_ner_model(
 # ============================================================
 # 9. OVERLAP-AWARE BIOCLINICALBERT NER
 # ============================================================
-
+# pylint: disable-next=too-many-locals
 def predict_word_labels(
     text,
     tokenizer,
@@ -670,23 +672,23 @@ def predict_word_labels(
 # 10. MERGE BIO LABELS INTO COMPLETE ENTITIES
 # ============================================================
 
-def merge_bio_entities(
-    word_predictions
-):
+
+def merge_bio_entities(word_predictions):
+    # pylint: disable=unsupported-assignment-operation
+    # pylint: disable=unsubscriptable-object
+    # pylint: disable=too-many-branches
     """
-    Convert word-level BIO predictions into complete
-    clinical entities.
+    Merge word-level BIO predictions into complete clinical entities.
 
     Example:
-
-        chest     B-Sign_symptom
-        pain      I-Sign_symptom
+        chest -> B-Sign_symptom
+        pain  -> I-Sign_symptom
 
     becomes:
-
         {
             "text": "chest pain",
-            "type": "Sign_symptom"
+            "type": "Sign_symptom",
+            "confidence": 0.92
         }
     """
 
@@ -694,117 +696,87 @@ def merge_bio_entities(
 
     current_entity = None
 
-
     for prediction in word_predictions:
 
         word = prediction["word"]
-
         label = prediction["label"]
-
-        confidence = prediction.get(
-            "confidence",
-            0.0
-        )
-
+        confidence = prediction.get("confidence", 0.0)
 
         # ----------------------------------------------------
-        # OUTSIDE ENTITY
+        # O = word is outside an entity
         # ----------------------------------------------------
 
         if label == "O":
 
-            if current_entity is not None:
+            if isinstance(current_entity, dict):
 
-                # Average confidence across entity words.
-                scores = current_entity.pop(
-                    "_scores"
-                )
+                scores = current_entity.pop("_scores", [])
 
-                current_entity[
-                    "confidence"
-                ] = round(
-                    sum(scores) / len(scores),
-                    4
-                )
+                if scores:
+                    current_entity["confidence"] = round(
+                        sum(scores) / len(scores),
+                        4
+                    )
+                else:
+                    current_entity["confidence"] = 0.0
 
-                entities.append(
-                    current_entity
-                )
+                entities.append(current_entity)
 
-                current_entity = None
+            current_entity = None
 
             continue
 
+        # ----------------------------------------------------
+        # Safety check
+        # ----------------------------------------------------
 
-        # Ignore malformed labels safely.
         if "-" not in label:
             continue
 
-
-        prefix, entity_type = (
-            label.split(
-                "-",
-                1
-            )
-        )
-
+        prefix, entity_type = label.split("-", 1)
 
         # ----------------------------------------------------
-        # BEGINNING OF ENTITY
+        # B = beginning of a new entity
         # ----------------------------------------------------
 
         if prefix == "B":
 
-            if current_entity is not None:
+            # Save previous entity first
+            if isinstance(current_entity, dict):
 
-                scores = current_entity.pop(
-                    "_scores"
-                )
+                scores = current_entity.pop("_scores", [])
 
-                current_entity[
-                    "confidence"
-                ] = round(
-                    sum(scores) / len(scores),
-                    4
-                )
+                if scores:
+                    current_entity["confidence"] = round(
+                        sum(scores) / len(scores),
+                        4
+                    )
+                else:
+                    current_entity["confidence"] = 0.0
 
-                entities.append(
-                    current_entity
-                )
+                entities.append(current_entity)
 
-
+            # Start new entity
             current_entity = {
-
                 "text": word,
-
                 "type": entity_type,
-
-                "_scores": [
-                    confidence
-                ],
+                "_scores": [confidence]
             }
 
-
         # ----------------------------------------------------
-        # INSIDE ENTITY
+        # I = continuation of an entity
         # ----------------------------------------------------
 
         elif prefix == "I":
 
             if (
-                current_entity is not None
-                and
-                current_entity["type"]
-                == entity_type
+                isinstance(current_entity, dict)
+                and current_entity.get("type") == entity_type
             ):
 
-                current_entity[
-                    "text"
-                ] += " " + word
+                current_entity["text"] += " " + word
 
-                current_entity[
-                    "_scores"
-                ].append(
+                current_entity["_scores"].append(
                     confidence
                 )
 
@@ -812,65 +784,59 @@ def merge_bio_entities(
 
                 # BIO repair:
                 #
-                # If the model predicts I-X without an
-                # existing B-X, treat it as the start of
-                # an entity instead of silently losing it.
+                # If the model predicts I-X but there is no
+                # matching B-X before it, treat this I-X as
+                # the beginning of a new entity.
 
-                if current_entity is not None:
+                if isinstance(current_entity, dict):
 
                     scores = current_entity.pop(
-                        "_scores"
+                        "_scores",
+                        []
                     )
 
-                    current_entity[
-                        "confidence"
-                    ] = round(
-                        sum(scores) / len(scores),
-                        4
-                    )
+                    if scores:
+                        current_entity["confidence"] = round(
+                            sum(scores) / len(scores),
+                            4
+                        )
+                    else:
+                        current_entity["confidence"] = 0.0
 
                     entities.append(
                         current_entity
                     )
 
-
                 current_entity = {
-
                     "text": word,
-
                     "type": entity_type,
-
-                    "_scores": [
-                        confidence
-                    ],
+                    "_scores": [confidence]
                 }
 
-
     # --------------------------------------------------------
-    # SAVE FINAL ENTITY
+    # Save the final entity
     # --------------------------------------------------------
 
-    if current_entity is not None:
+    if isinstance(current_entity, dict):
 
         scores = current_entity.pop(
-            "_scores"
+            "_scores",
+            []
         )
 
-        current_entity[
-            "confidence"
-        ] = round(
-            sum(scores) / len(scores),
-            4
-        )
+        if scores:
+            current_entity["confidence"] = round(
+                sum(scores) / len(scores),
+                4
+            )
+        else:
+            current_entity["confidence"] = 0.0
 
         entities.append(
             current_entity
         )
 
-
     return entities
-
-
 # ============================================================
 # 11. NEGATION DETECTION
 # ============================================================
