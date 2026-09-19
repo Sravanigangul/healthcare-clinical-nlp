@@ -1,258 +1,565 @@
 # Healthcare Clinical NLP
 
-A hands-on portfolio exploring Natural Language Processing (NLP) techniques for clinical and healthcare text.
+An end-to-end Clinical NLP and Healthcare AI portfolio project for extracting structured clinical information from unstructured healthcare documents.
 
-This repository documents my progression from foundational clinical text processing and rule-based NLP to text classification, word embeddings, transformer-based representations, ICD-10 code retrieval, and medication extraction.
+The project progresses from rule-based NLP and traditional machine learning to transformer-based clinical Named Entity Recognition (NER) using BioClinicalBERT, long-document processing, medication extraction, negation detection, and structured clinical document analysis.
+
+The current system is being developed into a **Clinical Document Review Assistant** capable of processing clinical documents and organizing extracted information for downstream review.
+
+---
 
 ## Project Overview
 
-Clinical data contains a large amount of valuable information in unstructured text such as clinical notes, discharge summaries, diagnoses, and medication documentation.
+Clinical notes, discharge summaries, reports, and other healthcare documents contain valuable information in unstructured text.
 
-This project explores different approaches for transforming that unstructured text into structured and machine-readable information that can support downstream healthcare analytics and machine learning tasks.
+This project explores how Natural Language Processing and machine learning can transform this text into structured information such as:
 
-The repository progresses from traditional NLP approaches to modern embedding and transformer-based methods.
+- Conditions and diagnoses
+- Signs and symptoms
+- Medications
+- Laboratory values
+- Diagnostic procedures
+- Therapeutic procedures
+- Demographics
+- Negated clinical findings
+- ICD-10 candidate codes
+- Drug-drug interaction information
 
-## Clinical NLP Workflow
+The project combines:
 
-Clinical Text  
-↓  
-Text Cleaning & Normalization  
-↓  
-Clinical Entity / Information Extraction  
-↓  
-Feature Representation  
-↓  
-Text Classification & Semantic Similarity  
-↓  
-Transformer Embeddings  
-↓  
-Clinical Applications
+- Rule-based clinical NLP
+- Traditional machine learning
+- Word embeddings
+- Transformer models
+- BioClinicalBERT fine-tuning
+- Long-document NER
+- Structured clinical information extraction
 
-## Notebooks
+---
 
-### 1. Clinical Text Processing
+## Clinical Document Intelligence Pipeline
 
-**Notebook:** `Clinical_Text_Processing.ipynb`
+```text
+Clinical Document / PDF
+          │
+          ▼
+    Text Extraction
+          │
+          ▼
+   Clinical Preprocessing
+          │
+          ▼
+ ┌───────────────────────┐
+ │   BioClinicalBERT NER │
+ └───────────┬───────────┘
+             │
+     Long-document inference
+     512-token windows
+     128-token overlap
+             │
+             ▼
+      Clinical Entities
+             │
+    ┌────────┼─────────┐
+    ▼        ▼         ▼
+Conditions Symptoms Procedures
+             │
+             ▼
+     Negation Detection
+             │
+             ▼
+    Structured Patient Record
+             │
+    ┌────────┼───────────┐
+    ▼        ▼           ▼
+Medication  Labs      DDI Checking
+Extraction
+             │
+             ▼
+     Clinical Review Output
+```
 
-Foundational preprocessing techniques for clinical text, including:
+Future application layers will include ICD-10 candidate linking, expanded medication normalization and interaction retrieval, Retrieval-Augmented Generation (RAG), and grounded document summarization.
 
-- Text cleaning and normalization
-- Clinical abbreviation handling
+---
+
+# BioClinicalBERT Clinical NER
+
+A major component of this project is a supervised clinical NER model built by fine-tuning:
+
+**BioClinicalBERT — `emilyalsentzer/Bio_ClinicalBERT`**
+
+The model was trained using the MACCROBAT clinical NLP dataset.
+
+## Dataset
+
+- 200 clinical documents
+- 140 training documents
+- 30 validation documents
+- 30 held-out test documents
+- 41 clinical entity categories
+- 82 observed BIO labels
+
+The split was performed at the **document level** to prevent information leakage between training, validation, and test sets.
+
+---
+
+## Long-Document Processing
+
+Many clinical documents exceed BERT's 512-token context limit.
+
+Instead of truncating these documents, the pipeline uses:
+
+- Maximum sequence length: 512 tokens
+- Overlap stride: 128 tokens
+- WordPiece-to-original-word alignment
+- First-WordPiece label supervision
+- Overlap-aware logit aggregation
+- Document-level reconstruction
+
+Training documents produced 286 model chunks and validation documents produced 64 chunks.
+
+During document-level inference, predictions for words appearing in overlapping windows are aggregated before reconstructing the complete BIO sequence.
+
+---
+
+## Model Training
+
+Selected configuration:
+
+| Parameter | Value |
+|---|---|
+| Base model | BioClinicalBERT |
+| Learning rate | 5e-5 |
+| Epochs | 5 |
+| Training batch size | 2 |
+| Gradient accumulation | 2 |
+| Effective batch size | 4 |
+| Weight decay | 0.01 |
+| Maximum sequence length | 512 |
+| Stride | 128 |
+| Mixed precision | FP16 |
+| Random seed | 42 |
+
+The best model was selected using validation entity-level F1 rather than test-set performance.
+
+---
+
+## Validation Performance
+
+Using overlap-aware document-level reconstruction:
+
+| Metric | Score |
+|---|---:|
+| Precision | 0.5505 |
+| Recall | 0.6176 |
+| F1 | 0.5821 |
+
+---
+
+## Held-Out Test Performance
+
+The final selected model was evaluated once on the held-out test set after model selection.
+
+| Metric | Score |
+|---|---:|
+| Precision | **0.5805** |
+| Recall | **0.6500** |
+| Entity-level Micro F1 | **0.6133** |
+
+**Final held-out test F1: 61.33%**
+
+This is an entity-level micro F1 score and should not be interpreted as classification accuracy.
+
+---
+
+## Model Error Analysis
+
+Error analysis showed that the largest source of model error was not BIO boundary detection.
+
+Among incorrect token-level predictions:
+
+| Error Type | Percentage |
+|---|---:|
+| Wrong entity type | 49.32% |
+| Entity ↔ non-entity | 41.19% |
+| BIO boundary only | 9.49% |
+
+Common semantic confusions included:
+
+- Disease/disorder ↔ sign/symptom
+- Diagnostic procedure ↔ detailed description
+- Detailed description ↔ biological structure
+- Diagnostic procedure ↔ biological structure
+- Family history ↔ history
+
+These results suggest that semantic differentiation between clinically related entity categories is a larger challenge than BIO boundary detection alone.
+
+---
+
+## Controlled Experiments
+
+Several training configurations were evaluated using the validation set.
+
+Experiments included:
+
+- 3-epoch baseline
+- 5-epoch training
+- Learning rate comparison
+- Class-weighted loss
+- Per-entity evaluation
+- Error analysis
+- Overlap-aware document reconstruction
+
+A 5-epoch model using a learning rate of `5e-5` provided the strongest validation performance among the evaluated configurations.
+
+Class weighting increased recall slightly but reduced overall F1, so the unweighted model was retained.
+
+---
+
+# Clinical NLP Application
+
+The application layer converts model output into a structured clinical record.
+
+Current components include:
+
+### BioClinicalBERT NER
+
+Extracts clinical entity categories from text using the fine-tuned transformer model.
+
+### Long-Document Inference
+
+Processes documents using overlapping 512-token windows and aggregates predictions across overlapping regions.
+
+### Medication Extraction
+
+Extracts:
+
+- Medication name
+- Dose
+- Unit
+- Route
+- Frequency
+
+### Laboratory Extraction
+
+Extracts selected laboratory measurements and their values/units.
+
+### Negation Detection
+
+Identifies findings preceded by common clinical negation expressions.
+
+Example:
+
+```text
+Patient denies fever.
+```
+
+The extracted fever entity can be separated from active clinical findings.
+
+### Drug-Drug Interaction Prototype
+
+Extracted medications can currently be compared against a small educational interaction reference.
+
+This component is intentionally limited and is not a comprehensive medication safety system.
+
+### Structured Patient Record
+
+The pipeline organizes extracted information into a structure similar to:
+
+```json
+{
+  "demographics": {},
+  "conditions": [],
+  "symptoms": [],
+  "medications": [],
+  "labs": [],
+  "diagnostic_procedures": [],
+  "therapeutic_procedures": [],
+  "negated_findings": [],
+  "icd10_candidates": [],
+  "drug_interactions": [],
+  "entities": [],
+  "summary": ""
+}
+```
+
+---
+
+# Notebooks
+
+## 1. Clinical Text Processing
+
+`Clinical_Text_Processing.ipynb`
+
+Covers:
+
+- Text cleaning
+- Normalization
+- Clinical abbreviations
 - Regular expressions
-- Clinical section extraction
+- Section extraction
 - Structured information extraction
-- Preparation of clinical text for downstream NLP tasks
 
-### 2. Clinical Named Entity Recognition
+---
 
-**Notebook:** `Clinical_Named_Entity_Recognition.ipynb`
+## 2. Clinical Named Entity Recognition
 
-Explores identification of clinically meaningful entities from unstructured text.
+`Clinical_Named_Entity_Recognition.ipynb`
 
-Topics include:
+Covers:
 
 - Clinical entity extraction
-- Rule-based pattern matching
-- Regular-expression-based extraction
-- Clinical terminology recognition
-- Negation handling
-- Evaluation of extracted entities
-
-### 3. Clinical Text Classification
-
-**Notebook:** `Clinical Text Classification.ipynb`
-
-Explores traditional machine learning approaches for classifying clinical text.
-
-Topics include:
-
-- Bag-of-Words representations
-- TF-IDF
-- Unigrams and n-grams
-- Logistic Regression
-- Naive Bayes
-- Linear SVM
-- Model comparison
-- ROC-AUC and F1 evaluation
-- Clinical note classification
-- Readmission-related text modeling
-
-This notebook demonstrates how unstructured clinical text can be transformed into numerical features and used with supervised machine learning models.
-
-### 4. Word Embeddings & Word2Vec
-
-**Notebook:** `Word Embeddings & Word2Vec.ipynb`
-
-Explores distributed word representations and semantic relationships between clinical terms.
-
-Topics include:
-
-- Word2Vec
-- Skip-gram
-- Continuous Bag of Words (CBOW)
-- Context windows
-- Vocabulary construction
-- Cosine similarity
-- Clinical word relationships
-- Word analogy experiments
-- Document vectors using averaged word embeddings
-- Dimensionality reduction
-- PCA and t-SNE visualization
-
-The notebook demonstrates how embeddings capture relationships between clinical terms beyond simple word-frequency representations.
-
-### 5. ClinicalBERT & Transformer Embeddings
-
-**Notebook:** `ClinicalBERT.ipynb`
-
-Introduces transformer-based NLP and contextual embeddings for clinical text.
-
-Topics include:
-
-- BERT architecture
-- Bidirectional self-attention
-- WordPiece tokenization
-- Contextual embeddings
-- SentenceTransformer embeddings
-- Cosine similarity between clinical notes
-- PCA visualization of embedding spaces
-- Zero-shot classification
-- ClinicalBERT
-- BioBERT and PubMedBERT
-- ClinicalBERT fine-tuning workflow
-- Readmission classification concepts
-
-This notebook explores the transition from static word embeddings such as Word2Vec to contextual transformer-based representations.
-
-### 6. ICD Coding & Medication Extraction
-
-**Notebook:** `ICD Coding & Medication Extraction.ipynb`
-
-Applies NLP techniques to clinical coding and medication-related tasks.
-
-Topics include:
-
-- TF-IDF-based ICD-10 candidate retrieval
-- Cosine-similarity ranking
-- ICD-10 format validation
-- Structured medication extraction
-- Drug name recognition
-- Dose extraction
-- Medication units
-- Route and frequency extraction
-- Medication reconciliation
-- Identification of continued medications
-- Identification of discontinued medications
-- New medications at discharge
-- Dose-change detection
-- Rule-based drug-drug interaction checking
-
-This notebook demonstrates how NLP can be combined with clinical reference data and rule-based logic to create structured healthcare information from free text.
-
-## Methods Explored
-
-The repository covers several generations of NLP techniques:
-
-### Rule-Based NLP
-- Regular expressions
-- Clinical dictionaries
 - Pattern matching
-- Negation detection
-- Medication extraction
+- Rule-based NER
+- Negation
+- Evaluation
 
-### Traditional NLP & Machine Learning
+---
+
+## 3. MACCROBAT Data Exploration
+
+`MACCROBAT_Data_Exploration.ipynb`
+
+Explores the labeled clinical corpus used for supervised NER development, including entity distributions and document-level dataset preparation.
+
+---
+
+## 4. Clinical NER Training
+
+`Clinical_NER_Training.ipynb`
+
+Contains the end-to-end BioClinicalBERT NER experiment:
+
+- Dataset preparation
+- BIO label construction
+- WordPiece alignment
+- Long-document chunking
+- BioClinicalBERT fine-tuning
+- Validation
+- Controlled experiments
+- Error analysis
+- Document-level reconstruction
+- Held-out test evaluation
+
+---
+
+## 5. Clinical Text Classification
+
+`Clinical Text Classification.ipynb`
+
+Explores:
+
 - Bag of Words
 - TF-IDF
 - N-grams
 - Logistic Regression
 - Naive Bayes
 - Linear SVM
+- F1 and ROC-AUC evaluation
 
-### Word Embeddings
+---
+
+## 6. Word Embeddings & Word2Vec
+
+`Word Embeddings & Word2Vec.ipynb`
+
+Explores:
+
 - Word2Vec
 - Skip-gram
 - CBOW
 - Cosine similarity
 - Document embeddings
+- PCA
+- t-SNE
 
-### Transformer-Based NLP
-- BERT concepts
-- Sentence Transformers
-- ClinicalBERT
+---
+
+## 7. ClinicalBERT
+
+`ClinicalBERT.ipynb`
+
+Explores:
+
+- BERT architecture
+- WordPiece tokenization
 - Contextual embeddings
+- ClinicalBERT
+- BioBERT
+- PubMedBERT
+- Sentence Transformers
 - Zero-shot classification
 - Fine-tuning concepts
 
-## Technologies
+---
+
+## 8. ICD Coding & Medication Extraction
+
+`ICD Coding & Medication Extraction.ipynb`
+
+Explores:
+
+- ICD-10 candidate retrieval
+- TF-IDF similarity
+- Medication extraction
+- Dose / unit / route / frequency
+- Medication reconciliation
+- Dose-change detection
+- Prototype drug-drug interaction checking
+
+---
+
+# Technologies
+
+### NLP & Machine Learning
 
 - Python
+- spaCy
+- Scikit-learn
+- Hugging Face Transformers
+- PyTorch
+- BioClinicalBERT
+- Sentence Transformers
+- Gensim / Word2Vec
+
+### Data & Analysis
+
 - Pandas
 - NumPy
-- Regular Expressions (Regex)
-- Scikit-learn
 - Matplotlib
-- spaCy
-- Gensim
+
+### NLP Methods
+
+- Regex and rule-based NLP
+- TF-IDF
+- N-grams
 - Word2Vec
-- Hugging Face Transformers
-- Sentence Transformers
-- PyTorch
-- ClinicalBERT
+- Contextual embeddings
+- BIO tagging
+- Transformer fine-tuning
+- Long-document inference
+- Semantic similarity
+- Clinical NER
 
-## Key Concepts Practiced
+---
 
-Through these notebooks, I am developing practical understanding of:
+# Repository Structure
 
-- Processing unstructured clinical text
-- Representing text numerically
-- Extracting clinically meaningful information
-- Building and evaluating text classifiers
-- Understanding semantic similarity
-- Working with static and contextual embeddings
-- Applying transformer models to healthcare text
-- Retrieving ICD-10 candidates from clinical descriptions
-- Structuring medication information
-- Connecting NLP techniques with healthcare use cases
+```text
+healthcare-clinical-nlp/
+│
+├── app/
+│   ├── app.py
+│   ├── clinical_nlp.py
+│   └── references.py
+│
+├── notebooks/
+│   ├── Clinical_Text_Processing.ipynb
+│   ├── Clinical_Named_Entity_Recognition.ipynb
+│   ├── MACCROBAT_Data_Exploration.ipynb
+│   ├── Clinical_NER_Training.ipynb
+│   ├── Clinical Text Classification.ipynb
+│   ├── Word Embeddings & Word2Vec.ipynb
+│   ├── ClinicalBERT.ipynb
+│   └── ICD Coding & Medication Extraction.ipynb
+│
+├── tests/
+│
+├── models/
+│
+├── requirements.txt
+├── Dockerfile
+└── README.md
+```
 
-## Repository Structure
+---
 
-    healthcare-clinical-nlp/
-    │
-    ├── notebooks/
-    │   ├── Clinical_Text_Processing.ipynb
-    │   ├── Clinical_Named_Entity_Recognition.ipynb
-    │   ├── Clinical Text Classification.ipynb
-    │   ├── Word Embeddings & Word2Vec.ipynb
-    │   ├── ClinicalBERT.ipynb
-    │   └── ICD Coding & Medication Extraction.ipynb
-    │
-    └── README.md
+# Current Development
 
-## Project Status
+The current development phase is focused on converting the NLP experiments into an end-to-end **Clinical Document Review Assistant**.
 
-This repository is an ongoing learning and portfolio project. Additional experiments will focus on applying these NLP techniques to larger public or de-identified healthcare datasets and developing more complete end-to-end clinical NLP workflows.
+Planned pipeline:
 
-## Important Note
+```text
+PDF Upload
+   ↓
+Page-Aware Text Extraction
+   ↓
+BioClinicalBERT NER
+   ↓
+Medication + Lab Extraction
+   ↓
+Negation Detection
+   ↓
+Drug Normalization
+   ↓
+ICD-10 Candidate Linking
+   ↓
+Drug Interaction Retrieval
+   ↓
+RAG Knowledge Retrieval
+   ↓
+Grounded LLM Summarization
+   ↓
+Clinical Review Dashboard
+```
 
-The examples in this repository are intended for educational and portfolio purposes. Some exercises use synthetic clinical text, manually created reference data, or simplified rule-based approaches.
+---
 
-The outputs should not be interpreted as clinical recommendations or used for patient care, medical coding, medication safety decisions, or other clinical decision-making without appropriate validation.
+# Limitations
 
-## Future Work
+This project is an educational and portfolio system and is **not a clinical decision-support system**.
 
-Planned areas for further development include:
+Important limitations include:
 
-- End-to-end clinical NLP pipelines
-- Fine-tuning transformer models on labeled clinical data
-- Long-document clinical text processing
-- Improved clinical entity linking
-- Semantic search and retrieval
-- Evaluation on larger public or de-identified datasets
-- Retrieval-Augmented Generation (RAG) for healthcare information
-- Model evaluation, explainability, and error analysis
+- The NER model was trained on a relatively small public clinical NLP dataset.
+- Performance varies substantially across entity categories.
+- Rare entity classes have limited training examples.
+- Medication and DDI reference components are currently limited.
+- ICD-10 candidate suggestions require further development and validation.
+- Model-generated confidence does not represent calibrated clinical certainty.
+- Clinical outputs require human review.
 
-## Author
+---
+
+# Reproducibility Note
+
+The original final trained checkpoint was stored in temporary Google Colab runtime storage and was lost when the runtime reset.
+
+The preprocessing pipeline, selected hyperparameters, validation results, error analysis, and held-out test metrics were preserved.
+
+The selected model can therefore be reproduced using the documented configuration and random seed, although GPU training can produce small numerical differences between runs.
+
+The reported held-out test result corresponds to the original completed experiment.
+
+---
+
+# Future Work
+
+- PDF and long-document ingestion
+- ICD-10 entity linking
+- RxNorm-style medication normalization
+- Expanded drug-interaction retrieval
+- Clinical relation extraction
+- Evidence and page-level provenance
+- Retrieval-Augmented Generation (RAG)
+- Grounded clinical summarization
+- Model explainability
+- Application deployment
+
+---
+
+# Important Note
+
+All examples and outputs are intended for educational, research, and portfolio purposes.
+
+The system should not be used for patient care, diagnosis, medical coding, medication safety decisions, or other clinical decision-making without appropriate validation and professional review.
+
+---
+
+# Author
 
 **Sravani Gangula**
 
-Healthcare Data Science | Clinical NLP | Data Science | Healthcare AI
+Healthcare Data Science | Clinical NLP | Machine Learning | Healthcare AI
