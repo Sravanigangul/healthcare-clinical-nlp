@@ -218,27 +218,29 @@ def check_ddi(medication_list):
 # 6. LAB EXTRACTION
 # ============================================================
 
+
 def extract_labs(text):
-    """
-    Extract a small set of common laboratory values
-    using deterministic regular expressions.
-    """
+    """Extract common laboratory values from clinical text."""
+
+    lab_patterns = {
+        "hemoglobin": r"\bhemoglobin\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(g/dL)?",
+        "creatinine": r"\bcreatinine\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(mg/dL)?",
+        "glucose": r"\bglucose\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(mg/dL)?",
+    }
 
     labs = []
 
-    for lab_name, pattern in LAB_PATTERNS.items():
+    for lab_name, pattern in lab_patterns.items():
+        matches = re.finditer(pattern, text, flags=re.IGNORECASE)
 
-        for match in re.finditer(
-            pattern,
-            text,
-            re.IGNORECASE
-        ):
-
-            labs.append({
-                "name": lab_name,
-                "value": match.group(1),
-                "unit": match.group(2) or "",
-            })
+        for match in matches:
+            labs.append(
+                {
+                    "lab": lab_name,
+                    "value": match.group(1),
+                    "unit": match.group(2) or "",
+                }
+            )
 
     return labs
 
@@ -413,6 +415,14 @@ def predict_word_labels(
 
     words = [
         token.text
+        for token in doc
+    ]
+
+    word_offsets = [
+        {
+            "start": token.idx,
+            "end": token.idx + len(token.text)
+        }
         for token in doc
     ]
 
@@ -655,6 +665,9 @@ def predict_word_labels(
             "word": word,
 
             "word_id": word_id,
+            "start": word_offsets[word_id]["start"],
+
+            "end": word_offsets[word_id]["end"],
 
             "label": predicted_label,
 
@@ -701,6 +714,8 @@ def merge_bio_entities(word_predictions):
         word = prediction["word"]
         label = prediction["label"]
         confidence = prediction.get("confidence", 0.0)
+        start = prediction.get("start")
+        end = prediction.get("end")
 
         # ----------------------------------------------------
         # O = word is outside an entity
@@ -760,6 +775,8 @@ def merge_bio_entities(word_predictions):
             current_entity = {
                 "text": word,
                 "type": entity_type,
+                "start": start,
+                "end": end,
                 "_scores": [confidence]
             }
 
@@ -775,6 +792,8 @@ def merge_bio_entities(word_predictions):
             ):
 
                 current_entity["text"] += " " + word
+
+                current_entity["end"] = end
 
                 current_entity["_scores"].append(
                     confidence
@@ -810,6 +829,8 @@ def merge_bio_entities(word_predictions):
                 current_entity = {
                     "text": word,
                     "type": entity_type,
+                    "start": start,
+                    "end": end,
                     "_scores": [confidence]
                 }
 
@@ -1050,7 +1071,352 @@ def deduplicate_list(values):
 
     return result
 
+def extract_vitals_from_entities(entities):
+    """
+    Build structured vital signs from BioClinicalBERT entities.
 
+    BioClinicalBERT identifies the clinical concept and its nearby
+    Lab_value. This function links recognized vital concepts with
+    their following value.
+    """
+
+    vital_names = {
+        "blood pressure",
+        "heart rate",
+        "temperature",
+        "respiratory rate",
+        "oxygen saturation",
+        "spo2",
+    }
+
+    vitals = []
+
+    for index, entity in enumerate(entities):
+        entity_text = entity["text"].strip().lower()
+        # Is this entity a recognized vital concept?
+        if entity_text not in vital_names:
+            continue
+        #Look at the next model-extracted entity
+        if index + 1 >= len(entities):
+            continue
+        next_entity = entities[index + 1]
+        #The value should have been identifies by BERT as Lab_value.
+        if next_entity["type"] != "Lab_value":
+            continue
+
+        vitals.append(
+            {
+                "name" : entity_text,
+                "value": next_entity["text"],
+                "concept_confidence": entity.get("confidence"),
+                "value_confidence": next_entity.get("confidence"),
+            }
+        )
+
+def extract_clinical_sections(text):
+    """
+    Split a clinical document into sections based on section headings.
+
+    Returns:
+        dict: Section name -> section text
+    """
+
+    sections = {}
+    current_section = "UNSECTIONED"
+    current_lines = []
+
+    for line in text.splitlines():
+
+        cleaned_line = line.strip()
+
+        if not cleaned_line:
+            continue
+
+        # A short, uppercase line is treated as a possible section heading.
+        is_heading = (
+            cleaned_line.isupper()
+            and len(cleaned_line.split()) <= 6
+        )
+
+        if is_heading:
+
+            # Save the previous section.
+            if current_lines:
+                sections[current_section] = "\n".join(current_lines)
+
+            current_section = cleaned_line
+            current_lines = []
+
+        else:
+            current_lines.append(cleaned_line)
+
+    # Save the final section.
+    if current_lines:
+        sections[current_section] = "\n".join(current_lines)
+
+    return sections
+def extract_clinical_section_spans(text):
+    """
+    Identify clinical sections while preserving their
+    positions in the original document.
+
+    Returns:
+        list: Section dictionaries containing the section
+        name, text, start offset, and end offset.
+    """
+
+    sections = []
+
+    lines = text.splitlines(keepends=True)
+
+    current_section = None
+    current_start = None
+    current_lines = []
+
+    position = 0
+
+    for line in lines:
+        cleaned_line = line.strip()
+
+        is_heading = (
+            cleaned_line
+            and cleaned_line.isupper()
+            and len(cleaned_line.split()) <= 6
+        )
+
+        if is_heading:
+            if current_section is not None:
+                section_text = "".join(
+                    current_lines
+                ).strip()
+
+                sections.append({
+                    "section": current_section,
+                    "text": section_text,
+                    "start": current_start,
+                    "end": position,
+                })
+
+            current_section = cleaned_line
+            current_start = position + len(line)
+            current_lines = []
+
+        elif current_section is not None:
+            current_lines.append(line)
+
+        position += len(line)
+
+    if current_section is not None:
+        section_text = "".join(
+            current_lines
+        ).strip()
+
+        sections.append({
+            "section": current_section,
+            "text": section_text,
+            "start": current_start,
+            "end": len(text),
+        })
+
+    return sections
+
+def assign_entities_to_sections(
+    entities,
+    section_spans
+):
+    """
+    Assign full-document entities to their clinical sections
+    using character offsets.
+
+    Args:
+        entities:
+            Entities extracted from the full clinical document.
+
+        section_spans:
+            Clinical sections with global start/end offsets.
+
+    Returns:
+        list: Entities with section information added.
+    """
+
+    section_entities = []
+
+    for entity in entities:
+
+        entity_start = entity.get("start")
+        entity_end = entity.get("end")
+
+        if entity_start is None or entity_end is None:
+            continue
+
+        entity_with_section = entity.copy()
+
+        for section in section_spans:
+
+            section_start = section["start"]
+            section_end = section["end"]
+
+            if (
+                entity_start >= section_start
+                and entity_end <= section_end
+            ):
+                entity_with_section["section"] = (
+                    section["section"]
+                )
+                break
+
+        section_entities.append(
+            entity_with_section
+        )
+
+    return section_entities
+
+def extract_section_items(sections, section_name):
+    """
+    Extract individual line-based items from a clinical section.
+
+    Useful for list-like sections such as:
+        PAST MEDICAL HISTORY
+        ALLERGIES
+        MEDICATIONS
+
+    Each non-empty line is preserved as a separate item.
+    """
+
+    section_text = sections.get(
+        section_name,
+        ""
+    )
+
+    if not section_text:
+        return []
+
+    items = [
+        line.strip()
+        for line in section_text.splitlines()
+        if line.strip()
+    ]
+
+    return items
+
+def extract_section_entities(
+    sections,
+    tokenizer,
+    model
+):
+    """
+    Run BioClinicalBERT on each clinical section separately
+    and preserve the section associated with every entity.
+    """
+
+    section_entities = []
+
+    for section_name, section_text in sections.items():
+
+        # Run BioClinicalBERT on this section.
+        word_predictions = predict_word_labels(
+            section_text,
+            tokenizer,
+            model,
+            max_length=512,
+            stride=128,
+        )
+
+        # Convert BIO token predictions into complete entities.
+        entities = merge_bio_entities(
+            word_predictions
+        )
+
+        # Preserve the section for each entity.
+        for entity in entities:
+
+            entity_with_section = entity.copy()
+
+            entity_with_section[
+                "section"
+            ] = section_name
+
+            section_entities.append(
+                entity_with_section
+            )
+
+    return section_entities
+
+def link_section_concepts_to_values(
+    section_entities,
+    section_name,
+    concept_types=None,
+    value_types=None,
+    max_distance=20,
+):
+    """
+    Link clinical concepts to nearby values within the same section.
+
+    Example:
+        Blood pressure -> 148/92 mmHg
+        Heart rate     -> 96 bpm
+    """
+
+    if concept_types is None:
+        concept_types = {"Diagnostic_procedure"}
+
+    if value_types is None:
+        value_types = {"Lab_value"}
+
+    # Keep only entities belonging to the requested section.
+    entities = [
+        entity
+        for entity in section_entities
+        if entity.get("section") == section_name
+    ]
+
+    # Keep entities in document order.
+    entities.sort(
+        key=lambda entity: entity.get("start", 0)
+    )
+
+    linked_values = []
+
+    for index, entity in enumerate(entities):
+
+        # We only start a pair from a clinical concept.
+        if entity.get("type") not in concept_types:
+            continue
+
+        concept_end = entity.get("end")
+
+        if concept_end is None:
+            continue
+
+        # Search forward for the nearest value.
+        for candidate in entities[index + 1:]:
+
+            candidate_start = candidate.get("start")
+
+            if candidate_start is None:
+                continue
+
+            distance = candidate_start - concept_end
+
+            # Candidate is too far away.
+            if distance > max_distance:
+                break
+
+            if candidate.get("type") in value_types:
+
+                linked_values.append({
+                    "name": entity["text"],
+                    "value": candidate["text"],
+                    "section": section_name,
+                    "concept_confidence": entity.get("confidence"),
+                    "value_confidence": candidate.get("confidence"),
+                    "start": entity["start"],
+                    "end": candidate["end"],
+                })
+
+                break
+
+    return linked_values
 # ============================================================
 # 14. BUILD COMPLETE PATIENT RECORD
 # ============================================================
@@ -1063,119 +1429,120 @@ def build_patient_record(
     """
     Run the complete Clinical Document Review pipeline.
 
-    BioClinicalBERT is the core entity extraction engine.
-
-    Regex/rule-based components provide supporting
-    structured extraction for medications, labs,
-    negation and DDI checking.
+    BioClinicalBERT runs once on the full clinical document.
+    Extracted entities are then assigned to clinical sections
+    using global character offsets.
     """
 
-    patient_record = (
-        create_patient_record()
-    )
-
+    patient_record = create_patient_record()
 
     if not text or not text.strip():
         return patient_record
-
 
     # --------------------------------------------------------
     # A. MEDICATION EXTRACTION
     # --------------------------------------------------------
 
-    medications = extract_meds(
-        text
-    )
-
-
-    patient_record[
-        "medications"
-    ] = medications
-
+    medications = extract_meds(text)
+    patient_record["medications"] = medications
 
     # --------------------------------------------------------
-    # B. LAB EXTRACTION
+    # B. LAB EXTRACTION - RULE-BASED FALLBACK
     # --------------------------------------------------------
 
-    structured_labs = extract_labs(
-        text
-    )
-
-
-    patient_record[
-        "labs"
-    ] = structured_labs
-
+    structured_labs = extract_labs(text)
+    patient_record["labs"] = structured_labs
 
     # --------------------------------------------------------
     # C. DRUG INTERACTIONS
     # --------------------------------------------------------
 
-    patient_record[
-        "drug_interactions"
-    ] = check_ddi(
+    patient_record["drug_interactions"] = check_ddi(
         medications
     )
 
-
     # --------------------------------------------------------
-    # D. BIOCLINICALBERT NER
+    # D. CLINICAL SECTION DETECTION
     # --------------------------------------------------------
 
-    word_predictions = (
-        predict_word_labels(
-            text,
-            tokenizer,
-            model,
-            max_length=512,
-            stride=128,
-        )
+    sections = extract_clinical_sections(text)
+
+    section_spans = extract_clinical_section_spans(
+        text
     )
 
+    # Conditions from the structured medical-history section.
+    history_conditions = extract_section_items(
+        sections,
+        "PAST MEDICAL HISTORY"
+    )
 
     # --------------------------------------------------------
-    # E. BIO → COMPLETE ENTITIES
+    # E. BIOCLINICALBERT - SINGLE FULL-DOCUMENT PASS
     # --------------------------------------------------------
+
+    word_predictions = predict_word_labels(
+        text,
+        tokenizer,
+        model,
+        max_length=512,
+        stride=128,
+    )
 
     entities = merge_bio_entities(
         word_predictions
     )
 
-
-    # Store ALL model-extracted entities.
-    patient_record[
-        "entities"
-    ] = entities
-
+    patient_record["entities"] = entities
 
     # --------------------------------------------------------
-    # F. NEGATION
+    # F. ASSIGN FULL-DOCUMENT ENTITIES TO SECTIONS
     # --------------------------------------------------------
 
-    negated_entities = (
-        detect_negated_entities(
-            text,
-            entities
-        )
+    section_entities = assign_entities_to_sections(
+        entities,
+        section_spans
     )
 
+    # --------------------------------------------------------
+    # G. SECTION-AWARE VALUE LINKING
+    # --------------------------------------------------------
 
-    patient_record[
-        "negated_findings"
-    ] = [
+    linked_vitals = link_section_concepts_to_values(
+        section_entities,
+        "VITAL SIGNS"
+    )
+
+    linked_labs = link_section_concepts_to_values(
+        section_entities,
+        "LABORATORY RESULTS"
+    )
+
+    patient_record["vitals"] = linked_vitals
+
+    # Prefer model-based section-aware labs when available.
+    # Keep regex extraction as a fallback.
+    if linked_labs:
+        patient_record["labs"] = linked_labs
+
+    # --------------------------------------------------------
+    # H. NEGATION
+    # --------------------------------------------------------
+
+    negated_entities = detect_negated_entities(
+        text,
+        entities
+    )
+
+    patient_record["negated_findings"] = [
         {
             "text": entity["text"],
             "type": entity["type"],
-            "confidence": entity.get(
-                "confidence"
-            ),
+            "confidence": entity.get("confidence"),
         }
         for entity in negated_entities
     ]
 
-
-    # Build simple keys for removing negated entities
-    # from active findings.
     negated_keys = {
         (
             entity["text"].lower(),
@@ -1184,13 +1551,9 @@ def build_patient_record(
         for entity in negated_entities
     }
 
-
     active_entities = [
-
         entity
-
         for entity in entities
-
         if (
             entity["text"].lower(),
             entity["type"],
@@ -1198,91 +1561,52 @@ def build_patient_record(
         not in negated_keys
     ]
 
-
     # --------------------------------------------------------
-    # G. MAP ACTIVE ENTITIES INTO STRUCTURED RECORD
-    # --------------------------------------------------------
-
-    patient_record = (
-        add_entities_to_patient_record(
-            patient_record,
-            active_entities
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # H. DEDUPLICATE SIMPLE OUTPUTS
+    # I. MAP ACTIVE ENTITIES INTO STRUCTURED RECORD
     # --------------------------------------------------------
 
-    patient_record[
-        "conditions"
-    ] = deduplicate_list(
-        patient_record[
-            "conditions"
-        ]
+    patient_record = add_entities_to_patient_record(
+        patient_record,
+        active_entities
     )
 
+    # --------------------------------------------------------
+    # J. ADD SECTION-BASED CONDITIONS
+    # --------------------------------------------------------
 
-    patient_record[
-        "symptoms"
-    ] = deduplicate_list(
-        patient_record[
-            "symptoms"
-        ]
+    patient_record["conditions"].extend(
+        history_conditions
     )
 
+    # --------------------------------------------------------
+    # K. DEDUPLICATE SIMPLE OUTPUTS
+    # --------------------------------------------------------
 
-    patient_record[
-        "diagnostic_procedures"
-    ] = deduplicate_list(
-        patient_record[
-            "diagnostic_procedures"
-        ]
+    patient_record["conditions"] = deduplicate_list(
+        patient_record["conditions"]
     )
 
-
-    patient_record[
-        "therapeutic_procedures"
-    ] = deduplicate_list(
-        patient_record[
-            "therapeutic_procedures"
-        ]
+    patient_record["symptoms"] = deduplicate_list(
+        patient_record["symptoms"]
     )
 
-
-    patient_record[
-        "demographics"
-    ][
-        "age"
-    ] = deduplicate_list(
-        patient_record[
-            "demographics"
-        ][
-            "age"
-        ]
+    patient_record["diagnostic_procedures"] = deduplicate_list(
+        patient_record["diagnostic_procedures"]
     )
 
-
-    patient_record[
-        "demographics"
-    ][
-        "sex"
-    ] = deduplicate_list(
-        patient_record[
-            "demographics"
-        ][
-            "sex"
-        ]
+    patient_record["therapeutic_procedures"] = deduplicate_list(
+        patient_record["therapeutic_procedures"]
     )
 
+    patient_record["demographics"]["age"] = deduplicate_list(
+        patient_record["demographics"]["age"]
+    )
+
+    patient_record["demographics"]["sex"] = deduplicate_list(
+        patient_record["demographics"]["sex"]
+    )
 
     return patient_record
-
-
-# ============================================================
-# 15. SIMPLE COMPATIBILITY FUNCTION
-# ============================================================
 
 def analyze_note(
     text,
