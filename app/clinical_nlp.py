@@ -268,6 +268,8 @@ def create_patient_record():
 
         "medications": [],
 
+        "allergies": [],
+
         "labs": [],
 
         "vitals": [],
@@ -996,12 +998,23 @@ def add_entities_to_patient_record(
 
         elif entity_type == "Diagnostic_procedure":
 
-            patient_record[
-                "diagnostic_procedures"
-            ].append(
-                entity_text
-            )
+            entity_section = entity.get("section")
 
+            excluded_sections = {
+                "VITAL SIGNS",
+                "LABORATORY RESULTS",
+                "PLAN",
+            }
+
+            if (
+                entity_section
+                and entity_section not in excluded_sections
+            ):
+                patient_record[
+                    "diagnostic_procedures"
+                ].append(
+                    entity_text
+                )
 
         elif entity_type == "Therapeutic_procedure":
 
@@ -1035,6 +1048,21 @@ def add_entities_to_patient_record(
 
 
     return patient_record
+
+def get_allergy_section_entities(
+    section_entities,
+    section_name="ALLERGIES",
+):
+    """
+    Return BioClinicalBERT entities found within
+    the allergy section.
+    """
+
+    return [
+        entity
+        for entity in section_entities
+        if entity.get("section") == section_name
+    ]
 
 
 # ============================================================
@@ -1421,17 +1449,147 @@ def link_section_concepts_to_values(
 # 14. BUILD COMPLETE PATIENT RECORD
 # ============================================================
 
-def build_patient_record(
-    text,
-    tokenizer,
-    model
+def link_medications_to_dosages(
+    section_entities,
+    section_name="MEDICATIONS",
+    max_distance=20,
 ):
+    """
+    Link medication entities to nearby dosage entities
+    within the medication section
+    """
+
+    entities = [
+        entity
+        for entity in section_entities
+        if entity.get("section") == section_name
+    ]
+
+    entities.sort(
+        key=lambda entity: entity.get("start",0)
+    )
+
+    linked_medications = []
+
+    for index, entity in enumerate(entities):
+
+        if entity.get("type") != "Medication":
+            continue
+
+        medication_end = entity.get("end")
+
+        if medication_end is None:
+            continue
+
+        for candidate in entities[index + 1:]:
+
+            candidate_start = candidate.get("start")
+
+            if candidate_start is None:
+                continue
+
+            distance = (
+                candidate_start - medication_end
+            )
+
+            if distance > max_distance:
+                break
+
+            # Stop if we reach another medication.
+            if candidate.get("type") == "Medication":
+                break
+
+            if candidate.get("type") == "Dosage":
+
+                linked_medications.append({
+                    "medication": entity["text"],
+                    "dosage": candidate["text"],
+                    "section": section_name,
+                    "medication_confidence": entity.get(
+                        "confidence"
+                    ),
+                    "dosage_confidence": candidate.get(
+                        "confidence"
+                    ),
+                    "start": entity["start"],
+                    "end": candidate["end"],
+                })
+
+                break
+
+    return linked_medications
+
+import re
+
+def parse_dosage(dosage_text):
+    """
+    Parse a dosage phrase into dose, unit, and frequency.
+    """
+
+    result = {
+        "dose":"",
+        "unit":"",
+        "frequency":"",
+    }
+
+    if not dosage_text:
+        return result
+    match = re.match(
+        r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*(.*)$",
+        dosage_text,
+    )
+
+    if match:
+        result["dose"] = match.group(1)
+        result["unit"] = match.group(2)
+        result["frequency"] = match.group(3).strip()
+
+    return result
+
+def build_structured_medications(section_entities):
+    """
+    Build structured medication records from BERT-extracted
+    medication and dosage entities.
+    """
+
+    linked_medications = link_medications_to_dosages(
+        section_entities
+    )
+
+    structured_medications = []
+
+    for medication in linked_medications:
+
+        parsed_dosage = parse_dosage(
+            medication["dosage"]
+        )
+
+        structured_medications.append({
+            "drug": medication["medication"],
+            "dose": parsed_dosage["dose"],
+            "unit": parsed_dosage["unit"],
+            "frequency": parsed_dosage["frequency"],
+            "route": "",
+            "section": medication["section"],
+            "medication_confidence": medication[
+                "medication_confidence"
+            ],
+            "dosage_confidence": medication[
+                "dosage_confidence"
+            ],
+            "start": medication["start"],
+            "end": medication["end"],
+        })
+
+    return structured_medications
+
+def build_patient_record(text, tokenizer, model):
     """
     Run the complete Clinical Document Review pipeline.
 
     BioClinicalBERT runs once on the full clinical document.
-    Extracted entities are then assigned to clinical sections
-    using global character offsets.
+    Extracted entities are assigned to clinical sections using
+    global character offsets.
     """
 
     patient_record = create_patient_record()
@@ -1439,47 +1597,22 @@ def build_patient_record(
     if not text or not text.strip():
         return patient_record
 
-    # --------------------------------------------------------
-    # A. MEDICATION EXTRACTION
-    # --------------------------------------------------------
-
-    medications = extract_meds(text)
-    patient_record["medications"] = medications
-
-    # --------------------------------------------------------
-    # B. LAB EXTRACTION - RULE-BASED FALLBACK
-    # --------------------------------------------------------
-
-    structured_labs = extract_labs(text)
-    patient_record["labs"] = structured_labs
-
-    # --------------------------------------------------------
-    # C. DRUG INTERACTIONS
-    # --------------------------------------------------------
-
-    patient_record["drug_interactions"] = check_ddi(
-        medications
-    )
-
-    # --------------------------------------------------------
-    # D. CLINICAL SECTION DETECTION
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 1. Identify clinical sections and their document offsets
+    # ---------------------------------------------------------
 
     sections = extract_clinical_sections(text)
 
-    section_spans = extract_clinical_section_spans(
-        text
-    )
+    section_spans = extract_clinical_section_spans(text)
 
-    # Conditions from the structured medical-history section.
     history_conditions = extract_section_items(
         sections,
-        "PAST MEDICAL HISTORY"
+        "PAST MEDICAL HISTORY",
     )
 
-    # --------------------------------------------------------
-    # E. BIOCLINICALBERT - SINGLE FULL-DOCUMENT PASS
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 2. Run BioClinicalBERT ONCE on the full document
+    # ---------------------------------------------------------
 
     word_predictions = predict_word_labels(
         text,
@@ -1495,43 +1628,53 @@ def build_patient_record(
 
     patient_record["entities"] = entities
 
-    # --------------------------------------------------------
-    # F. ASSIGN FULL-DOCUMENT ENTITIES TO SECTIONS
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 3. Assign BERT entities to clinical sections
+    # ---------------------------------------------------------
 
     section_entities = assign_entities_to_sections(
         entities,
-        section_spans
+        section_spans,
     )
 
-    # --------------------------------------------------------
-    # G. SECTION-AWARE VALUE LINKING
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 4. Build structured medications from BERT entities
+    # ---------------------------------------------------------
+
+    medications = build_structured_medications(
+        section_entities
+    )
+
+    patient_record["medications"] = medications
+
+    # ---------------------------------------------------------
+    # 5. Extract structured vitals and laboratory results
+    # ---------------------------------------------------------
 
     linked_vitals = link_section_concepts_to_values(
         section_entities,
-        "VITAL SIGNS"
+        "VITAL SIGNS",
     )
 
     linked_labs = link_section_concepts_to_values(
         section_entities,
-        "LABORATORY RESULTS"
+        "LABORATORY RESULTS",
     )
 
     patient_record["vitals"] = linked_vitals
 
-    # Prefer model-based section-aware labs when available.
-    # Keep regex extraction as a fallback.
     if linked_labs:
         patient_record["labs"] = linked_labs
+    else:
+        patient_record["labs"] = extract_labs(text)
 
-    # --------------------------------------------------------
-    # H. NEGATION
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 6. Detect negated clinical entities
+    # ---------------------------------------------------------
 
     negated_entities = detect_negated_entities(
         text,
-        entities
+        entities,
     )
 
     patient_record["negated_findings"] = [
@@ -1553,7 +1696,7 @@ def build_patient_record(
 
     active_entities = [
         entity
-        for entity in entities
+        for entity in section_entities
         if (
             entity["text"].lower(),
             entity["type"],
@@ -1561,26 +1704,23 @@ def build_patient_record(
         not in negated_keys
     ]
 
-    # --------------------------------------------------------
-    # I. MAP ACTIVE ENTITIES INTO STRUCTURED RECORD
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 7. Add active BERT entities to patient record
+    # ---------------------------------------------------------
 
     patient_record = add_entities_to_patient_record(
         patient_record,
-        active_entities
+        active_entities,
     )
 
-    # --------------------------------------------------------
-    # J. ADD SECTION-BASED CONDITIONS
-    # --------------------------------------------------------
-
+    # Add conditions explicitly listed in PMH.
     patient_record["conditions"].extend(
         history_conditions
     )
 
-    # --------------------------------------------------------
-    # K. DEDUPLICATE SIMPLE OUTPUTS
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
+    # 8. Remove duplicate clinical concepts
+    # ---------------------------------------------------------
 
     patient_record["conditions"] = deduplicate_list(
         patient_record["conditions"]
@@ -1604,6 +1744,14 @@ def build_patient_record(
 
     patient_record["demographics"]["sex"] = deduplicate_list(
         patient_record["demographics"]["sex"]
+    )
+
+    # ---------------------------------------------------------
+    # 9. Drug-interaction checking
+    # ---------------------------------------------------------
+
+    patient_record["drug_interactions"] = check_ddi(
+        medications
     )
 
     return patient_record
