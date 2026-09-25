@@ -268,7 +268,10 @@ def create_patient_record():
 
         "medications": [],
 
-        "allergies": [],
+        "allergies": {
+            "status": "unknown",
+            "items": [],
+        },          
 
         "labs": [],
 
@@ -1064,6 +1067,55 @@ def get_allergy_section_entities(
         if entity.get("section") == section_name
     ]
 
+def extract_structured_allergies(
+    sections,
+    section_entities,
+    section_name="ALLERGIES",
+):
+    """
+    Extract allergy information from a structured allergy section.
+    """
+
+    allergy_text = sections.get(section_name, "").strip()
+
+    result = {
+        "status": "unknown",
+        "items": [],
+    }
+
+    if not allergy_text:
+        return result
+
+    normalized_text = allergy_text.lower()
+
+    no_allergy_phrases = {
+        "no known drug allergies",
+        "no known allergies",
+        "nkda",
+        "nka",
+    }
+
+    if normalized_text in no_allergy_phrases:
+        result["status"] = "none_documented"
+        return result
+
+    allergy_entities = get_allergy_section_entities(
+        section_entities,
+        section_name,
+    )
+
+    result["status"] = "documented"
+
+    for entity in allergy_entities:
+        result["items"].append({
+            "source_text": entity["text"],
+            "entity_type": entity["type"],
+            "confidence": entity.get("confidence"),
+            "section": section_name,
+            "page": entity.get("page"),
+        })
+
+    return result
 
 # ============================================================
 # 13. REMOVE DUPLICATES
@@ -1299,6 +1351,38 @@ def assign_entities_to_sections(
 
     return section_entities
 
+def assign_entities_to_pages(entities, page_spans):
+    """
+    Assign each extracted entity to its source PDF page
+    using global character offsets.
+    """
+
+    entities_with_pages = []
+
+    for entity in entities:
+
+        entity_with_page = entity.copy()
+
+        entity_start = entity.get("start")
+        entity_end = entity.get("end")
+
+        if entity_start is None or entity_end is None:
+            entities_with_pages.append(entity_with_page)
+            continue
+
+        for page_span in page_spans:
+
+            if (
+                entity_start >= page_span["start"]
+                and entity_end <= page_span["end"]
+            ):
+                entity_with_page["page"] = page_span["page"]
+                break
+
+        entities_with_pages.append(entity_with_page)
+
+    return entities_with_pages
+
 def extract_section_items(sections, section_name):
     """
     Extract individual line-based items from a clinical section.
@@ -1440,6 +1524,7 @@ def link_section_concepts_to_values(
                     "value_confidence": candidate.get("confidence"),
                     "start": entity["start"],
                     "end": candidate["end"],
+                    "page": entity.get("page"),
                 })
 
                 break
@@ -1505,6 +1590,7 @@ def link_medications_to_dosages(
                     "medication": entity["text"],
                     "dosage": candidate["text"],
                     "section": section_name,
+                    "page": entity.get("page"),
                     "medication_confidence": entity.get(
                         "confidence"
                     ),
@@ -1571,6 +1657,7 @@ def build_structured_medications(section_entities):
             "frequency": parsed_dosage["frequency"],
             "route": "",
             "section": medication["section"],
+            "page": medication.get("page"),
             "medication_confidence": medication[
                 "medication_confidence"
             ],
@@ -1579,11 +1666,12 @@ def build_structured_medications(section_entities):
             ],
             "start": medication["start"],
             "end": medication["end"],
+            "page": medication.get("page"),
         })
 
     return structured_medications
 
-def build_patient_record(text, tokenizer, model):
+def build_patient_record(text, tokenizer, model, page_spans=None,):
     """
     Run the complete Clinical Document Review pipeline.
 
@@ -1622,9 +1710,13 @@ def build_patient_record(text, tokenizer, model):
         stride=128,
     )
 
-    entities = merge_bio_entities(
-        word_predictions
-    )
+    entities = merge_bio_entities(word_predictions)
+
+    if page_spans is not None:
+        entities = assign_entities_to_pages(
+            entities,
+            page_spans,
+        )
 
     patient_record["entities"] = entities
 
@@ -1636,6 +1728,13 @@ def build_patient_record(text, tokenizer, model):
         entities,
         section_spans,
     )
+
+    allergies = extract_structured_allergies(
+        sections,
+        section_entities,
+    )
+
+    patient_record["allergies"] = allergies
 
     # ---------------------------------------------------------
     # 4. Build structured medications from BERT entities
