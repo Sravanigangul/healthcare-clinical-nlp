@@ -1794,14 +1794,17 @@ def build_patient_record(text, tokenizer, model, page_spans=None,):
     }
 
     active_entities = [
-        entity
-        for entity in section_entities
-        if (
+    entity
+    for entity in section_entities
+    if (
+        (
             entity["text"].lower(),
             entity["type"],
         )
         not in negated_keys
-    ]
+        and entity.get("section") != "ALLERGIES"
+    )
+]
 
     # ---------------------------------------------------------
     # 7. Add active BERT entities to patient record

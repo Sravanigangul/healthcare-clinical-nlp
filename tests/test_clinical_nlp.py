@@ -1,3 +1,5 @@
+import torch
+
 from app.clinical_nlp import (
     extract_meds,
     check_ddi,
@@ -9,6 +11,12 @@ from app.clinical_nlp import (
     extract_structured_allergies,
     assign_entities_to_pages,
     link_medications_to_dosages,
+)
+
+from app.icd_linker import (
+    load_icd10_codes,
+    find_icd_candidates,
+    add_icd_candidates,
 )
 
 
@@ -281,3 +289,96 @@ def test_medication_page_provenance():
     assert len(result) == 1
     assert result[0]["medication"] == "Metformin"
     assert result[0]["page"] == 1
+
+def test_load_icd10_codes(tmp_path):
+    icd_file = tmp_path / "test_icd.txt"
+
+    icd_file.write_text(
+        "I10     Essential (primary) hypertension\n"
+        "E119    Type 2 diabetes mellitus without complications\n",
+        encoding="utf-8",
+    )
+
+    records = load_icd10_codes(icd_file)
+
+    assert len(records) == 2
+    assert records[0]["code"] == "I10"
+    assert records[0]["description"] == "Essential (primary) hypertension"
+    assert records[1]["code"] == "E119"
+
+def test_find_icd_candidates(monkeypatch):
+    records = [
+        {"code": "I10", "description": "Essential hypertension"},
+        {"code": "E119", "description": "Type 2 diabetes mellitus"},
+        {"code": "J189", "description": "Pneumonia"},
+    ]
+
+    icd_embeddings = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.5, 0.5],
+    ])
+
+    def fake_encode_concepts(texts, tokenizer, model):
+        return torch.tensor([[1.0, 0.0]])
+
+    monkeypatch.setattr(
+        "app.icd_linker.encode_concepts",
+        fake_encode_concepts,
+    )
+
+    results = find_icd_candidates(
+        query="hypertension",
+        records=records,
+        icd_embeddings=icd_embeddings,
+        tokenizer=None,
+        model=None,
+        top_k=2,
+    )
+
+    assert len(results) == 2
+    assert results[0]["code"] == "I10"
+    assert results[1]["code"] == "J189"
+    assert results[0]["similarity"] == 1.0
+
+def test_add_icd_candidates(monkeypatch):
+    patient_record = {
+        "conditions": [
+            "Hypertension",
+            "Type 2 diabetes mellitus",
+        ],
+        "icd10_candidates": [],
+    }
+
+    def fake_find_icd_candidates(
+        query,
+        records,
+        icd_embeddings,
+        tokenizer,
+        model,
+        top_k=5,
+    ):
+        return [
+            {
+                "code": "TEST",
+                "description": f"Candidate for {query}",
+                "similarity": 0.9,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "app.icd_linker.find_icd_candidates",
+        fake_find_icd_candidates,
+    )
+
+    result = add_icd_candidates(
+        patient_record,
+        icd_records=[],
+        icd_embeddings=None,
+        tokenizer=None,
+        model=None,
+    )
+
+    assert len(result["icd10_candidates"]) == 2
+    assert result["icd10_candidates"][0]["condition"] == "Hypertension"
+    assert result["icd10_candidates"][1]["condition"] == "Type 2 diabetes mellitus"
