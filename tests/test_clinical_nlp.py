@@ -19,6 +19,8 @@ from app.icd_linker import (
     add_icd_candidates,
 )
 
+from app.drug_normalizer import normalize_medications
+
 
 def test_extract_single_medication():
     text = "metoprolol 50mg PO BID"
@@ -382,3 +384,157 @@ def test_add_icd_candidates(monkeypatch):
     assert len(result["icd10_candidates"]) == 2
     assert result["icd10_candidates"][0]["condition"] == "Hypertension"
     assert result["icd10_candidates"][1]["condition"] == "Type 2 diabetes mellitus"
+
+def test_normalize_medications(monkeypatch):
+    medications = [
+        {
+            "drug": "Metformin",
+            "dose": "500",
+            "unit": "mg",
+            "frequency": "twice daily",
+            "page": 1,
+        }
+    ]
+
+    def fake_normalize_drug(drug_name):
+        return {
+            "drug": drug_name,
+            "rxcui": "6809",
+            "normalized_name": "metformin",
+            "term_type": "IN",
+        }
+
+    monkeypatch.setattr(
+        "app.drug_normalizer.normalize_drug",
+        fake_normalize_drug,
+    )
+
+    result = normalize_medications(medications)
+
+    assert len(result) == 1
+    assert result[0]["drug"] == "Metformin"
+    assert result[0]["dose"] == "500"
+    assert result[0]["unit"] == "mg"
+    assert result[0]["frequency"] == "twice daily"
+    assert result[0]["page"] == 1
+
+    assert result[0]["rxcui"] == "6809"
+    assert result[0]["normalized_name"] == "metformin"
+    assert result[0]["term_type"] == "IN"
+
+def test_select_best_dailymed_label_by_dose():
+    """DailyMed label selection should prefer the extracted dose."""
+
+    from app.dailymed import select_best_label
+
+    medication = {
+        "drug": "Aspirin",
+        "dose": "81",
+        "unit": "mg",
+    }
+
+    labels = [
+        {
+            "title": "ENTERIC ASPIRIN (ASPIRIN) TABLET",
+            "setid": "generic",
+        },
+        {
+            "title": "ASPIRIN 81 MG (ASPIRIN) TABLET, DELAYED RELEASE",
+            "setid": "81mg",
+        },
+    ]
+
+    selected = select_best_label(medication, labels)
+
+    assert selected["setid"] == "81mg"
+
+def test_extract_dailymed_safety_sections():
+    """DailyMed SPL parser should extract coded safety sections."""
+
+    from app.dailymed import extract_safety_sections
+
+    xml_text = """
+    <document xmlns="urn:hl7-org:v3">
+        <component>
+            <section>
+                <code code="34073-7"/>
+                <title>DRUG INTERACTIONS</title>
+                <text>
+                    Example interaction information.
+                </text>
+            </section>
+        </component>
+
+        <component>
+            <section>
+                <code code="34071-1"/>
+                <title>WARNINGS</title>
+                <text>
+                    Example warning information.
+                </text>
+            </section>
+        </component>
+    </document>
+    """
+
+    sections = extract_safety_sections(xml_text)
+
+    assert "drug_interactions" in sections
+    assert "warnings" in sections
+    assert "Example interaction information." in sections["drug_interactions"]
+    assert "Example warning information." in sections["warnings"]
+
+def test_enrich_medication_with_safety(monkeypatch):
+    """Medication enrichment should attach structured DailyMed evidence."""
+
+    from app import dailymed
+
+    medication = {
+        "drug": "Aspirin",
+        "dose": "81",
+        "unit": "mg",
+        "normalized_name": "aspirin",
+        "rxcui": "1191",
+    }
+
+    fake_labels = [
+        {
+            "title": "ASPIRIN 81 MG (ASPIRIN) TABLET",
+            "setid": "test-setid",
+            "published_date": "2026-01-01",
+        }
+    ]
+
+    monkeypatch.setattr(
+        dailymed,
+        "search_labels",
+        lambda drug_name: fake_labels,
+    )
+
+    monkeypatch.setattr(
+        dailymed,
+        "get_label_xml",
+        lambda setid: "<document></document>",
+    )
+
+    monkeypatch.setattr(
+        dailymed,
+        "extract_safety_sections",
+        lambda xml_text: {
+            "warnings": "Example warning."
+        },
+    )
+
+    result = dailymed.enrich_medication_with_safety(
+        medication
+    )
+
+    assert result["drug"] == "Aspirin"
+    assert result["rxcui"] == "1191"
+
+    safety = result["safety_evidence"]
+
+    assert safety["source"] == "DailyMed"
+    assert safety["setid"] == "test-setid"
+    assert safety["match_type"] == "reference_label"
+    assert safety["evidence"]["warnings"] == "Example warning."
